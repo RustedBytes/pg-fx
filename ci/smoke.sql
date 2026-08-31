@@ -5,8 +5,8 @@ SELECT fx_pair_base('BTC/USD'), fx_pair_quote('BTC/USD');
 
 SELECT fx_source_upsert('primary', 10, true, interval '30 seconds');
 SELECT fx_source_upsert('fallback', 20, true, interval '2 minutes');
-SELECT fx_rate_insert('primary', 'USD/EUR', 0.8510, 0.8520);
-SELECT fx_rate_insert('fallback', 'USD/EUR', 0.8500, 0.8530);
+SELECT fx_rate_insert('primary', 'USD/EUR', 0.8510, 0.8520, rate_volume => 100);
+SELECT fx_rate_insert('fallback', 'USD/EUR', 0.8500, 0.8530, rate_volume => 300);
 
 DO $assertions$
 BEGIN
@@ -20,6 +20,10 @@ BEGIN
     END IF;
     IF fx_convert(100, 'USD/EUR', 'sell_base', 0.851372941, 2) <> 85.14 THEN
         RAISE EXCEPTION 'explicit conversion rounding failed';
+    END IF;
+    IF (fx_vwap('USD/EUR')).bid <> 0.85025
+       OR (fx_weighted_median('USD/EUR')).ask <> 0.853 THEN
+        RAISE EXCEPTION 'volume-weighted composite failed';
     END IF;
 END
 $assertions$;

@@ -1,4 +1,4 @@
-`pg-fx` should be the pricing and quote layer between `pg_money` / `pg_crypto` and `pg-ledger`.
+`pg-fx` should be the pricing and quote layer between `pg_money` / `pg_cryptocurrency` and `pg-ledger`.
 
 Its job is not accounting, and it should not own balances. It should answer questions like: “What is the current executable USD/EUR price?”, “What rate did we quote this customer?”, “How much spread did we charge?”, “Which source produced this price?”, and “Was this quote still valid when the trade executed?”
 
@@ -8,7 +8,7 @@ A clean separation is:
 pg_money
     exact fiat amounts
 
-pg_crypto
+pg_cryptocurrency
     exact crypto assets and amounts
 
 pg_fx
@@ -58,7 +58,7 @@ struct FxPair {
 }
 ```
 
-where `Asset` can refer to either a `pg_money` currency or a `pg_crypto` asset.
+where `Asset` can refer to either a `pg_money` currency or a `pg_cryptocurrency` asset.
 
 That means `pg_fx` is not limited to fiat FX.
 
@@ -988,7 +988,7 @@ Rust market-data service
         │
         ├──────────────┐
         ▼              ▼
-    pg_money       pg_crypto
+    pg_money       pg_cryptocurrency
       fiat           crypto
         │              │
         └──────┬───────┘
@@ -999,6 +999,6 @@ Rust market-data service
 
 The clean rule I'd use is:
 
-**`pg_money` knows amounts. `pg_crypto` knows crypto assets. `pg_fx` knows what one asset is worth in another. `pg_ledger` knows where assets moved.**
+**`pg_money` knows amounts. `pg_cryptocurrency` knows crypto assets. `pg_fx` knows what one asset is worth in another. `pg_ledger` knows where assets moved.**
 
 That separation gives you a very strong foundation for the exchange service.

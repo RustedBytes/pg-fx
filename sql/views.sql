@@ -14,6 +14,7 @@ SELECT DISTINCT ON (r.pair)
     r.pair,
     r.bid,
     r.ask,
+    r.volume,
     (r.bid + r.ask) / 2 AS mid,
     r.observed_at,
     r.received_at,
@@ -29,7 +30,13 @@ WHERE s.enabled
 ORDER BY r.pair, s.priority, r.observed_at DESC, r.received_at DESC, r.id DESC;
 
 CREATE VIEW fx_quote_details AS
-SELECT q.*, (q.status = 'open' AND clock_timestamp() < q.expires_at) AS is_valid,
+SELECT q.*,
+       CASE
+           WHEN q.status = 'open' AND clock_timestamp() >= q.expires_at
+               THEN 'expired'::fx_quote_status
+           ELSE q.status
+       END AS effective_status,
+       (q.status = 'open' AND clock_timestamp() < q.expires_at) AS is_valid,
        s.name AS source_name
 FROM fx_quotes q
 JOIN fx_rates r ON r.id = q.source_rate_id

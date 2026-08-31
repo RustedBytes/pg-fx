@@ -88,6 +88,78 @@ mod tests {
         );
     }
 
+    #[pg_test]
+    fn latest_is_global_while_current_respects_source_priority() {
+        Spi::run(
+            "SELECT fx_source_upsert('primary', 1, true, interval '1 minute'); \
+             SELECT fx_source_upsert('secondary', 2, true, interval '1 minute'); \
+             SELECT fx_rate_insert('primary', 'USD/JPY', 145, 146, \
+                                   clock_timestamp() - interval '10 seconds'); \
+             SELECT fx_rate_insert('secondary', 'USD/JPY', 147, 148, \
+                                   clock_timestamp() - interval '1 second');",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<bool>(
+                "SELECT current_source.name = 'primary' AND latest_source.name = 'secondary' \
+                        AND (fx_composite_rate('USD/JPY', 'latest')).bid = 147 \
+                 FROM fx_rate_current('USD/JPY') current_rate \
+                 JOIN fx_sources current_source ON current_source.id = current_rate.source_id \
+                 CROSS JOIN fx_rate_latest('USD/JPY') latest_rate \
+                 JOIN fx_sources latest_source ON latest_source.id = latest_rate.source_id"
+            )
+            .unwrap(),
+            Some(true)
+        );
+    }
+
+    #[pg_test]
+    fn volume_weighted_and_trimmed_composites_are_available() {
+        Spi::run(
+            "SELECT fx_source_upsert('venue_a', 1, true, interval '1 minute'); \
+             SELECT fx_source_upsert('venue_b', 2, true, interval '1 minute'); \
+             SELECT fx_source_upsert('venue_c', 3, true, interval '1 minute'); \
+             SELECT fx_rate_insert('venue_a', 'BTC/USD', 90, 92, rate_volume => 1); \
+             SELECT fx_rate_insert('venue_b', 'BTC/USD', 100, 102, rate_volume => 8); \
+             SELECT fx_rate_insert('venue_c', 'BTC/USD', 110, 112, rate_volume => 1);",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<bool>(
+                "SELECT (vwap).bid = 100 AND (vwap).ask = 102 \
+                        AND (weighted).bid = 100 AND (weighted).ask = 102 \
+                        AND (trimmed).bid = 100 AND (trimmed).ask = 102 \
+                        AND (vwap).provenance->>'strategy' = 'vwap' \
+                 FROM (SELECT fx_vwap('BTC/USD') AS vwap, \
+                              fx_weighted_median('BTC/USD') AS weighted, \
+                              fx_trimmed_mean('BTC/USD') AS trimmed) prices"
+            )
+            .unwrap(),
+            Some(true)
+        );
+
+        Spi::run(
+            "SELECT fx_source_upsert('trim_' || value, 100 + value, true, interval '1 minute') \
+             FROM generate_series(1, 10) values(value); \
+             SELECT fx_rate_insert( \
+                 'trim_' || value, \
+                 'EUR/JPY', \
+                 CASE value WHEN 1 THEN 1 WHEN 10 THEN 100 ELSE 50 END, \
+                 CASE value WHEN 1 THEN 2 WHEN 10 THEN 101 ELSE 51 END \
+             ) \
+             FROM generate_series(1, 10) values(value);",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<bool>(
+                "SELECT (trimmed).bid = 50 AND (trimmed).ask = 51 \
+                 FROM (SELECT fx_trimmed_mean('EUR/JPY') AS trimmed) prices"
+            )
+            .unwrap(),
+            Some(true)
+        );
+    }
+
     #[pg_test(error = "FX rate stale")]
     fn stale_rates_are_rejected() {
         Spi::run(
@@ -227,6 +299,34 @@ mod tests {
         assert_eq!(
             Spi::get_one::<bool>(
                 "SELECT status = 'expired' AND NOT fx_quote_is_valid(id, expires_at) \
+                 FROM fx_quotes ORDER BY created_at DESC LIMIT 1"
+            )
+            .unwrap(),
+            Some(true)
+        );
+    }
+
+    #[pg_test]
+    fn effective_status_and_bulk_expiry_do_not_leave_due_quotes_open() {
+        seed_usd_eur();
+        Spi::run(
+            "SELECT fx_create_quote('USD/EUR', 'sell_base', 100, \
+                                    expires_in => interval '1 second')",
+        )
+        .unwrap();
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT fx_expire_quotes(( \
+                     SELECT expires_at FROM fx_quotes ORDER BY created_at DESC LIMIT 1 \
+                 ))"
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            Spi::get_one::<bool>(
+                "SELECT status = 'expired' \
+                        AND fx_quote_effective_status(id, expires_at) = 'expired' \
                  FROM fx_quotes ORDER BY created_at DESC LIMIT 1"
             )
             .unwrap(),

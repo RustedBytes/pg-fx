@@ -26,3 +26,8 @@ database.
 Because `fx_execute_quote` only changes quote status, callers must place it and
 the associated `pg_ledger` posting in the same database transaction. Use the
 quote ID as the ledger idempotency key to prevent duplicate execution.
+
+Quote validity derives from both stored status and `expires_at`. Use
+`fx_quote_is_valid` or `fx_quote_effective_status` for authorization and
+execution decisions; do not rely on stored `status` alone. A periodic
+`fx_expire_quotes` sweep persists due transitions for operational reporting.

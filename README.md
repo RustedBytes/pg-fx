@@ -50,10 +50,12 @@ SELECT fx_rate_insert(
     rate_pair          => 'USD/EUR',
     rate_bid           => 0.8510,
     rate_ask           => 0.8520,
-    rate_observed_at   => clock_timestamp()
+    rate_observed_at   => clock_timestamp(),
+    rate_volume        => 100000
 );
 
 SELECT fx_bid('USD/EUR'), fx_ask('USD/EUR'), fx_mid('USD/EUR');
+SELECT fx_vwap('USD/EUR'), fx_weighted_median('USD/EUR');
 ```
 
 Add a retail rule and create a first-class quote:
@@ -121,6 +123,20 @@ SELECT fx_enable_pg_cryptocurrency();
 The generic numeric conversion API always requires an explicit pair, side,
 rate, output scale, and rounding policy.
 
+Adapters also create typed `fx_create_quote` overloads. Native input values
+provide their canonical identity, while target metadata provides the output
+scale. Cast crypto targets explicitly:
+
+```sql
+SELECT fx_create_quote('1 BTC'::crypto_amount, 'ETH'::crypto_asset);
+SELECT fx_create_quote('USD 100'::money_with_currency, 'BTC'::crypto_asset);
+SELECT fx_create_quote('1 BTC'::crypto_amount, 'USD'::text);
+```
+
+Use `fx_quote_effective_status()` for a time-correct status without a write, and
+run `fx_expire_quotes()` periodically to persist due `open → expired`
+transitions.
+
 See [the SQL API](docs/API.md), [architecture](docs/ARCHITECTURE.md), and
 [security model](docs/SECURITY.md).
 
@@ -132,4 +148,6 @@ cargo clippy --all-targets --no-default-features --features pg18 -- \
     -D warnings -W clippy::pedantic
 cargo pgrx test pg18 --no-default-features --features pg18
 ./ci/test-extension.sh "$(cargo pgrx info pg-config 18)"
+./ci/test-companion-extensions.sh "$(cargo pgrx info pg-config 18)" \
+    ../pg-cryptocurrency ../pg-ledger
 ```

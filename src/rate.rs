@@ -11,8 +11,12 @@ pub enum fx_side {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PostgresEnum)]
 #[allow(non_camel_case_types)]
 pub enum fx_rate_strategy {
+    latest,
     priority,
     best_bid,
     best_ask,
     median,
+    weighted_median,
+    vwap,
+    trimmed_mean,
 }

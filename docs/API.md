@@ -7,7 +7,8 @@
   lowercase network namespace.
 - `fx_side`: `buy_base` or `sell_base`.
 - `fx_quote_status`: `open`, `executed`, `expired`, or `cancelled`.
-- `fx_rate_strategy`: `priority`, `best_bid`, `best_ask`, or `median`.
+- `fx_rate_strategy`: `latest`, `priority`, `best_bid`, `best_ask`, `median`,
+  `weighted_median`, `vwap`, or `trimmed_mean`.
 - `fx_rounding_mode`: `half_even`, `half_up`, `down`, or `up`.
 - `fx_price_snapshot`: derived pair, bid/ask, timestamps, and JSON provenance.
 
@@ -28,7 +29,7 @@ fx_source_upsert(source_name, source_priority = 100, source_enabled = true,
 fx_rate_insert(source, rate_pair, rate_bid, rate_ask,
                rate_observed_at = clock_timestamp(),
                rate_received_at = clock_timestamp(), rate_max_age = NULL,
-               rate_metadata = {})
+               rate_metadata = {}, rate_volume = NULL)
 fx_rate_latest(rate_pair)
 fx_rate_current(rate_pair, as_of = clock_timestamp())
 ```
@@ -39,6 +40,11 @@ observation for each enabled source, rejects observations older than the rate
 or source `max_age`, and chooses the lowest source priority. It raises instead
 of returning a stale price.
 
+`fx_rate_latest` returns the globally newest enabled observation without
+applying source priority or staleness. Use `fx_rate_current` for executable
+pricing. `rate_volume` is optional but must be positive when supplied;
+volume-weighted strategies use fresh observations that carry it.
+
 ## Prices and derivation
 
 ```text
@@ -48,6 +54,9 @@ fx_mid(pair, as_of = clock_timestamp())
 fx_best_bid(pair, as_of = clock_timestamp())
 fx_best_ask(pair, as_of = clock_timestamp())
 fx_composite_rate(pair, strategy = 'priority', as_of = clock_timestamp())
+fx_weighted_median(pair, as_of = clock_timestamp())
+fx_vwap(pair, as_of = clock_timestamp())
+fx_trimmed_mean(pair, as_of = clock_timestamp())
 fx_inverse(pair, bid, ask)
 fx_inverse(pair, as_of = clock_timestamp())
 fx_cross_rate(target_pair, via, as_of = clock_timestamp())
@@ -57,6 +66,10 @@ fx_spread_bps(pair, as_of = clock_timestamp())
 
 Inverse prices use `inverse bid = 1 / ask` and `inverse ask = 1 / bid`.
 Cross rates multiply both legs and retain both source-rate IDs in provenance.
+Composite strategies use the newest fresh observation from each enabled
+source. `trimmed_mean` removes the lowest and highest 10 percent by mid price;
+`weighted_median` and `vwap` use volume and raise when no fresh volume-bearing
+observation exists.
 
 ## Conversion and rounding
 
@@ -90,7 +103,9 @@ fx_create_quote(input, output_asset, customer_id = NULL,
                 output_scale = 2, rounding = 'half_even', quote_metadata = {})
 fx_get_quote(quote_id)
 fx_quote_is_valid(quote_id, as_of = clock_timestamp())
+fx_quote_effective_status(quote_id, as_of = clock_timestamp())
 fx_expire_quote(quote_id, as_of = clock_timestamp())
+fx_expire_quotes(as_of = clock_timestamp())
 fx_execute_quote(quote_id, executed_time = clock_timestamp())
 fx_cancel_quote(quote_id, cancelled_time = clock_timestamp())
 ```
@@ -105,6 +120,11 @@ side-aware:
 
 Quote pricing, provenance, identity, timestamps, and metadata are immutable.
 Only one state transition from `open` is accepted.
+
+Expiry is time-based before stored status is swept: `fx_quote_is_valid` returns
+false and `fx_quote_effective_status` returns `expired` at the boundary. Run
+`fx_expire_quotes()` periodically when persisted status must reflect every due
+quote. Cancellation expires a due quote instead of recording it as cancelled.
 
 ## Ledger metadata and validation
 
@@ -122,16 +142,36 @@ market and customer rates, spread, source, source-rate ID, and relevant times.
 ```text
 fx_enable_pg_money() -> boolean
 fx_enable_pg_cryptocurrency() -> boolean
+fx_enable_cross_asset_quotes() -> boolean
 ```
 
 With `pg_money`, `fx_convert(money_with_currency, text, numeric)` delegates to
 `money_exchange`. With `pg_cryptocurrency`,
 `fx_convert(crypto_amount, text, numeric, fx_rounding_mode)` uses the target
-asset's registered decimal scale. Adapter functions return `false` when the
-required extension or API is absent.
+asset's registered decimal scale; a target-typed `crypto_asset` overload is
+also installed. Adapter functions return `false` when the required extension
+or API is absent.
+
+The adapters also add exact-input quote overloads. They obtain the input amount
+and canonical identity from `money_with_currency` or `crypto_amount`, validate
+the target through the companion extension, and derive output precision from
+currency or crypto-asset metadata:
+
+```text
+fx_create_quote(money_with_currency, output_currency_text, ...)
+fx_create_quote(crypto_amount, crypto_asset, ...)
+fx_create_quote(money_with_currency, crypto_asset, ...)
+fx_create_quote(crypto_amount, output_currency_text, ...)
+```
+
+Cast crypto targets explicitly to `crypto_asset` and fiat targets paired with a
+`crypto_amount` explicitly to `text`; this avoids overload ambiguity for string
+literals. The cross-asset enable function returns false unless both companion
+extensions expose the required APIs.
 
 ## Views
 
 - `fx_current_rates`: current primary/fallback rows with calculated mid and age.
-- `fx_quote_details`: quote rows with live validity and source name.
+- `fx_quote_details`: quote rows with stored and effective status, live validity,
+  and source name.
 - `fx_active_rules`: rules active at statement time.

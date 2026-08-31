@@ -38,6 +38,7 @@ CREATE TABLE fx_rates (
     pair fx_pair NOT NULL,
     bid numeric NOT NULL CHECK (bid > 0),
     ask numeric NOT NULL CHECK (ask > 0),
+    volume numeric CHECK (volume IS NULL OR volume > 0),
     observed_at timestamptz NOT NULL,
     received_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     max_age interval CHECK (max_age IS NULL OR max_age > interval '0'),
@@ -48,6 +49,8 @@ CREATE TABLE fx_rates (
 COMMENT ON TABLE fx_rates IS 'Append-only normalized market observations with source provenance';
 COMMENT ON COLUMN fx_rates.observed_at IS 'Time at which the upstream source says the rate applied';
 COMMENT ON COLUMN fx_rates.received_at IS 'Time at which this database received the observation';
+COMMENT ON COLUMN fx_rates.volume IS
+    'Optional positive source volume used by weighted median and VWAP composites';
 
 CREATE FUNCTION fx_rates_immutable_guard()
 RETURNS trigger
@@ -241,7 +244,8 @@ CREATE FUNCTION fx_rate_insert(
     rate_observed_at timestamptz DEFAULT clock_timestamp(),
     rate_received_at timestamptz DEFAULT clock_timestamp(),
     rate_max_age interval DEFAULT NULL,
-    rate_metadata jsonb DEFAULT '{}'::jsonb
+    rate_metadata jsonb DEFAULT '{}'::jsonb,
+    rate_volume numeric DEFAULT NULL
 )
 RETURNS fx_rates
 LANGUAGE plpgsql
@@ -257,9 +261,13 @@ BEGIN
             USING ERRCODE = '22023', HINT = 'Register it with fx_source_upsert().';
     END IF;
 
-    INSERT INTO fx_rates(source_id, pair, bid, ask, observed_at, received_at, max_age, metadata)
-    VALUES (source_key, rate_pair, rate_bid, rate_ask, rate_observed_at,
-            rate_received_at, rate_max_age, rate_metadata)
+    INSERT INTO fx_rates(
+        source_id, pair, bid, ask, volume, observed_at, received_at, max_age, metadata
+    )
+    VALUES (
+        source_key, rate_pair, rate_bid, rate_ask, rate_volume, rate_observed_at,
+        rate_received_at, rate_max_age, rate_metadata
+    )
     RETURNING * INTO result;
     RETURN result;
 END
@@ -274,7 +282,7 @@ AS $function$
     FROM fx_rates r
     JOIN fx_sources s ON s.id = r.source_id
     WHERE r.pair = rate_pair AND s.enabled
-    ORDER BY s.priority, r.observed_at DESC, r.received_at DESC, r.id DESC
+    ORDER BY r.observed_at DESC, r.received_at DESC, r.id DESC
     LIMIT 1
 $function$;
 
@@ -389,7 +397,19 @@ DECLARE
     selected fx_rates;
     result fx_price_snapshot;
 BEGIN
-    IF strategy = 'priority' THEN
+    IF strategy = 'latest' THEN
+        SELECT candidates.* INTO selected
+        FROM (
+            SELECT DISTINCT ON (r.source_id) r.*
+            FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
+            WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
+              AND r.received_at <= as_of
+              AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
+            ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
+        ) candidates
+        ORDER BY candidates.observed_at DESC, candidates.received_at DESC, candidates.id DESC
+        LIMIT 1;
+    ELSIF strategy = 'priority' THEN
         selected := fx_rate_current(rate_pair, as_of);
     ELSIF strategy = 'best_bid' THEN
         SELECT candidates.* INTO selected
@@ -415,7 +435,7 @@ BEGIN
         ) candidates
         ORDER BY candidates.ask, candidates.bid DESC, candidates.id
         LIMIT 1;
-    ELSE
+    ELSIF strategy = 'median' THEN
         SELECT
             percentile_disc(0.5) WITHIN GROUP (ORDER BY candidates.bid),
             percentile_disc(0.5) WITHIN GROUP (ORDER BY candidates.ask),
@@ -439,6 +459,117 @@ BEGIN
         END IF;
         result.pair := rate_pair;
         RETURN result;
+    ELSIF strategy = 'weighted_median' THEN
+        WITH candidates AS MATERIALIZED (
+            SELECT DISTINCT ON (r.source_id) r.*
+            FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
+            WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
+              AND r.received_at <= as_of
+              AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
+              AND r.volume IS NOT NULL
+            ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
+        ), weighted_bid AS (
+            SELECT bid
+            FROM (
+                SELECT bid, id,
+                       sum(volume) OVER (ORDER BY bid, id) AS cumulative,
+                       sum(volume) OVER () AS total
+                FROM candidates
+            ) weighted
+            WHERE cumulative >= total / 2
+            ORDER BY bid, id
+            LIMIT 1
+        ), weighted_ask AS (
+            SELECT ask
+            FROM (
+                SELECT ask, id,
+                       sum(volume) OVER (ORDER BY ask, id) AS cumulative,
+                       sum(volume) OVER () AS total
+                FROM candidates
+            ) weighted
+            WHERE cumulative >= total / 2
+            ORDER BY ask, id
+            LIMIT 1
+        )
+        SELECT weighted_bid.bid, weighted_ask.ask,
+               min(candidates.observed_at), max(candidates.received_at),
+               jsonb_build_object(
+                   'strategy', 'weighted_median',
+                   'weight', 'volume',
+                   'source_rate_ids', jsonb_agg(candidates.id ORDER BY candidates.id)
+               )
+        INTO result.bid, result.ask, result.observed_at, result.received_at, result.provenance
+        FROM candidates CROSS JOIN weighted_bid CROSS JOIN weighted_ask
+        GROUP BY weighted_bid.bid, weighted_ask.ask;
+        IF result.bid IS NULL THEN
+            RAISE EXCEPTION 'weighted median requires a fresh rate with volume for pair %', rate_pair
+                USING ERRCODE = 'P0002';
+        END IF;
+        result.pair := rate_pair;
+        RETURN result;
+    ELSIF strategy = 'vwap' THEN
+        SELECT
+            sum(candidates.bid * candidates.volume) / sum(candidates.volume),
+            sum(candidates.ask * candidates.volume) / sum(candidates.volume),
+            min(candidates.observed_at),
+            max(candidates.received_at),
+            jsonb_build_object(
+                'strategy', 'vwap',
+                'weight', 'volume',
+                'total_volume', sum(candidates.volume),
+                'source_rate_ids', jsonb_agg(candidates.id ORDER BY candidates.id)
+            )
+        INTO result.bid, result.ask, result.observed_at, result.received_at, result.provenance
+        FROM (
+            SELECT DISTINCT ON (r.source_id) r.*
+            FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
+            WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
+              AND r.received_at <= as_of
+              AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
+              AND r.volume IS NOT NULL
+            ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
+        ) candidates;
+        IF result.bid IS NULL THEN
+            RAISE EXCEPTION 'VWAP requires a fresh rate with volume for pair %', rate_pair
+                USING ERRCODE = 'P0002';
+        END IF;
+        result.pair := rate_pair;
+        RETURN result;
+    ELSIF strategy = 'trimmed_mean' THEN
+        WITH candidates AS MATERIALIZED (
+            SELECT DISTINCT ON (r.source_id) r.*
+            FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
+            WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
+              AND r.received_at <= as_of
+              AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
+            ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
+        ), ranked AS (
+            SELECT candidates.*,
+                   row_number() OVER (ORDER BY (bid + ask) / 2, id) AS rank,
+                   count(*) OVER () AS candidate_count
+            FROM candidates
+        ), included AS (
+            SELECT *
+            FROM ranked
+            WHERE rank > floor(candidate_count * 0.1)
+              AND rank <= candidate_count - floor(candidate_count * 0.1)
+        )
+        SELECT avg(included.bid), avg(included.ask),
+               min(included.observed_at), max(included.received_at),
+               jsonb_build_object(
+                   'strategy', 'trimmed_mean',
+                   'trim_fraction', 0.1,
+                   'source_rate_ids', jsonb_agg(included.id ORDER BY included.id)
+               )
+        INTO result.bid, result.ask, result.observed_at, result.received_at, result.provenance
+        FROM included;
+        IF result.bid IS NULL THEN
+            PERFORM fx_rate_current(rate_pair, as_of);
+        END IF;
+        result.pair := rate_pair;
+        RETURN result;
+    ELSE
+        RAISE EXCEPTION 'unsupported FX rate strategy: %', strategy USING ERRCODE = '22023';
     END IF;
 
     IF selected.id IS NULL THEN
@@ -456,6 +587,33 @@ BEGIN
     RETURN result;
 END
 $function$;
+
+CREATE FUNCTION fx_weighted_median(
+    rate_pair fx_pair,
+    as_of timestamptz DEFAULT clock_timestamp()
+)
+RETURNS fx_price_snapshot
+LANGUAGE sql
+STABLE
+AS 'SELECT fx_composite_rate(rate_pair, ''weighted_median'', as_of)';
+
+CREATE FUNCTION fx_vwap(
+    rate_pair fx_pair,
+    as_of timestamptz DEFAULT clock_timestamp()
+)
+RETURNS fx_price_snapshot
+LANGUAGE sql
+STABLE
+AS 'SELECT fx_composite_rate(rate_pair, ''vwap'', as_of)';
+
+CREATE FUNCTION fx_trimmed_mean(
+    rate_pair fx_pair,
+    as_of timestamptz DEFAULT clock_timestamp()
+)
+RETURNS fx_price_snapshot
+LANGUAGE sql
+STABLE
+AS 'SELECT fx_composite_rate(rate_pair, ''trimmed_mean'', as_of)';
 
 CREATE FUNCTION fx_inverse(rate_pair fx_pair, rate_bid numeric, rate_ask numeric)
 RETURNS fx_price_snapshot
@@ -827,6 +985,22 @@ LANGUAGE sql
 VOLATILE
 AS 'SELECT COALESCE((SELECT status = ''open'' AND as_of < expires_at FROM fx_quotes WHERE id = quote_id), false)';
 
+CREATE FUNCTION fx_quote_effective_status(
+    quote_id text,
+    as_of timestamptz DEFAULT clock_timestamp()
+)
+RETURNS fx_quote_status
+LANGUAGE sql
+VOLATILE
+AS $function$
+    SELECT CASE
+        WHEN status = 'open' AND as_of >= expires_at THEN 'expired'::fx_quote_status
+        ELSE status
+    END
+    FROM fx_quotes
+    WHERE id = quote_id
+$function$;
+
 CREATE FUNCTION fx_expire_quote(quote_id text, as_of timestamptz DEFAULT clock_timestamp())
 RETURNS boolean
 LANGUAGE plpgsql
@@ -837,6 +1011,22 @@ BEGIN
     SET status = 'expired', status_changed_at = as_of
     WHERE id = quote_id AND status = 'open' AND expires_at <= as_of;
     RETURN FOUND;
+END
+$function$;
+
+CREATE FUNCTION fx_expire_quotes(as_of timestamptz DEFAULT clock_timestamp())
+RETURNS bigint
+LANGUAGE plpgsql
+VOLATILE
+AS $function$
+DECLARE
+    expired_count bigint;
+BEGIN
+    UPDATE fx_quotes
+    SET status = 'expired', status_changed_at = as_of
+    WHERE status = 'open' AND expires_at <= as_of;
+    GET DIAGNOSTICS expired_count = ROW_COUNT;
+    RETURN expired_count;
 END
 $function$;
 
@@ -869,8 +1059,15 @@ VOLATILE
 AS $function$
 BEGIN
     UPDATE fx_quotes
+    SET status = 'expired', status_changed_at = cancelled_time
+    WHERE id = quote_id AND status = 'open' AND expires_at <= cancelled_time;
+    IF FOUND THEN
+        RETURN false;
+    END IF;
+
+    UPDATE fx_quotes
     SET status = 'cancelled', status_changed_at = cancelled_time
-    WHERE id = quote_id AND status = 'open';
+    WHERE id = quote_id AND status = 'open' AND cancelled_time < expires_at;
     RETURN FOUND;
 END
 $function$;
@@ -924,6 +1121,10 @@ AS $function$
            jsonb_build_object('invalid_rows', count(*))
     FROM fx_rates WHERE bid <= 0 OR ask <= 0 OR bid > ask
     UNION ALL
+    SELECT 'market_volumes', count(*) = 0,
+           jsonb_build_object('invalid_rows', count(*))
+    FROM fx_rates WHERE volume IS NOT NULL AND volume <= 0
+    UNION ALL
     SELECT 'quote_provenance', count(*) = 0,
            jsonb_build_object('invalid_rows', count(*))
     FROM fx_quotes q LEFT JOIN fx_rates r ON r.id = q.source_rate_id
@@ -933,6 +1134,122 @@ AS $function$
            jsonb_build_object('invalid_rows', count(*))
     FROM fx_quotes
     WHERE input_amount <= 0 OR output_amount <= 0 OR fee < 0
+$function$;
+
+CREATE FUNCTION fx_enable_cross_asset_quotes()
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+AS $function$
+DECLARE
+    fx_schema name;
+    money_schema name;
+    crypto_schema name;
+BEGIN
+    SELECT n.nspname INTO fx_schema
+    FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+    WHERE e.extname = 'pg_fx';
+    SELECT n.nspname INTO money_schema
+    FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+    WHERE e.extname = 'pg_money';
+    SELECT n.nspname INTO crypto_schema
+    FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+    WHERE e.extname = 'pg_cryptocurrency';
+
+    IF fx_schema IS NULL OR money_schema IS NULL OR crypto_schema IS NULL
+       OR to_regtype(format('%I.money_with_currency', money_schema)) IS NULL
+       OR to_regtype(format('%I.crypto_amount', crypto_schema)) IS NULL
+       OR to_regtype(format('%I.crypto_asset', crypto_schema)) IS NULL
+       OR to_regprocedure(format(
+              '%I.money_amount(%I.money_with_currency)', money_schema, money_schema
+          )) IS NULL
+       OR to_regprocedure(format(
+              '%I.money_currency(%I.money_with_currency)', money_schema, money_schema
+          )) IS NULL
+       OR to_regprocedure(format('%I.money_make(numeric,text)', money_schema)) IS NULL
+       OR to_regprocedure(format('%I.money_currency_info(text)', money_schema)) IS NULL
+       OR to_regprocedure(format(
+              '%I.crypto_amount_value(%I.crypto_amount)', crypto_schema, crypto_schema
+          )) IS NULL
+       OR to_regprocedure(format(
+              '%I.crypto_amount_asset(%I.crypto_amount)', crypto_schema, crypto_schema
+          )) IS NULL
+       OR to_regprocedure(format(
+              '%I.crypto_asset_decimals(%I.crypto_asset)', crypto_schema, crypto_schema
+          )) IS NULL THEN
+        RETURN false;
+    END IF;
+
+    EXECUTE format(
+        $adapter$
+        CREATE OR REPLACE FUNCTION %1$I.fx_create_quote(
+            input %2$I.money_with_currency,
+            output_asset %3$I.crypto_asset,
+            customer_id text DEFAULT NULL,
+            customer_segment text DEFAULT 'retail',
+            expires_in interval DEFAULT interval '30 seconds',
+            rounding %1$I.fx_rounding_mode DEFAULT 'half_even',
+            quote_metadata jsonb DEFAULT '{}'::jsonb
+        ) RETURNS %1$I.fx_quotes
+        LANGUAGE plpgsql VOLATILE
+        SET search_path = %1$I, %2$I, %3$I, pg_catalog
+        AS $body$
+        BEGIN
+            RETURN %1$I.fx_create_quote(
+                %1$I.fx_pair(%2$I.money_currency(input), output_asset::text),
+                'sell_base'::%1$I.fx_side,
+                %2$I.money_amount(input),
+                customer_segment,
+                customer_id,
+                expires_in,
+                %3$I.crypto_asset_decimals(output_asset),
+                rounding,
+                quote_metadata
+            );
+        END
+        $body$
+        $adapter$,
+        fx_schema, money_schema, crypto_schema
+    );
+
+    EXECUTE format(
+        $adapter$
+        CREATE OR REPLACE FUNCTION %1$I.fx_create_quote(
+            input %3$I.crypto_amount,
+            output_currency text,
+            customer_id text DEFAULT NULL,
+            customer_segment text DEFAULT 'retail',
+            expires_in interval DEFAULT interval '30 seconds',
+            rounding %1$I.fx_rounding_mode DEFAULT 'half_even',
+            quote_metadata jsonb DEFAULT '{}'::jsonb
+        ) RETURNS %1$I.fx_quotes
+        LANGUAGE plpgsql VOLATILE
+        SET search_path = %1$I, %2$I, %3$I, pg_catalog
+        AS $body$
+        DECLARE
+            canonical_output text;
+            output_scale integer;
+        BEGIN
+            canonical_output := %2$I.money_currency(%2$I.money_make(0, output_currency));
+            output_scale := (%2$I.money_currency_info(canonical_output)->>'exponent')::integer;
+            RETURN %1$I.fx_create_quote(
+                %1$I.fx_pair(%3$I.crypto_amount_asset(input)::text, canonical_output),
+                'sell_base'::%1$I.fx_side,
+                %3$I.crypto_amount_value(input),
+                customer_segment,
+                customer_id,
+                expires_in,
+                output_scale,
+                rounding,
+                quote_metadata
+            );
+        END
+        $body$
+        $adapter$,
+        fx_schema, money_schema, crypto_schema
+    );
+    RETURN true;
+END
 $function$;
 
 CREATE FUNCTION fx_enable_pg_money()
@@ -956,7 +1273,15 @@ BEGIN
        OR to_regprocedure(format(
               '%I.money_exchange(%I.money_with_currency,text,numeric)',
               money_schema, money_schema
-          )) IS NULL THEN
+          )) IS NULL
+       OR to_regprocedure(format(
+              '%I.money_amount(%I.money_with_currency)', money_schema, money_schema
+          )) IS NULL
+       OR to_regprocedure(format(
+              '%I.money_currency(%I.money_with_currency)', money_schema, money_schema
+          )) IS NULL
+       OR to_regprocedure(format('%I.money_make(numeric,text)', money_schema)) IS NULL
+       OR to_regprocedure(format('%I.money_currency_info(text)', money_schema)) IS NULL THEN
         RETURN false;
     END IF;
 
@@ -974,6 +1299,43 @@ BEGIN
         fx_schema, money_schema, money_schema,
         fx_schema, money_schema, money_schema
     );
+    EXECUTE format(
+        $adapter$
+        CREATE OR REPLACE FUNCTION %1$I.fx_create_quote(
+            input %2$I.money_with_currency,
+            output_currency text,
+            customer_id text DEFAULT NULL,
+            customer_segment text DEFAULT 'retail',
+            expires_in interval DEFAULT interval '30 seconds',
+            rounding %1$I.fx_rounding_mode DEFAULT 'half_even',
+            quote_metadata jsonb DEFAULT '{}'::jsonb
+        ) RETURNS %1$I.fx_quotes
+        LANGUAGE plpgsql VOLATILE
+        SET search_path = %1$I, %2$I, pg_catalog
+        AS $body$
+        DECLARE
+            canonical_output text;
+            output_scale integer;
+        BEGIN
+            canonical_output := %2$I.money_currency(%2$I.money_make(0, output_currency));
+            output_scale := (%2$I.money_currency_info(canonical_output)->>'exponent')::integer;
+            RETURN %1$I.fx_create_quote(
+                %1$I.fx_pair(%2$I.money_currency(input), canonical_output),
+                'sell_base'::%1$I.fx_side,
+                %2$I.money_amount(input),
+                customer_segment,
+                customer_id,
+                expires_in,
+                output_scale,
+                rounding,
+                quote_metadata
+            );
+        END
+        $body$
+        $adapter$,
+        fx_schema, money_schema
+    );
+    PERFORM fx_enable_cross_asset_quotes();
     RETURN true;
 END
 $function$;
@@ -996,9 +1358,13 @@ BEGIN
 
     IF fx_schema IS NULL OR crypto_schema IS NULL
        OR to_regtype(format('%I.crypto_amount', crypto_schema)) IS NULL
+       OR to_regtype(format('%I.crypto_asset', crypto_schema)) IS NULL
        OR to_regprocedure(format('%I.crypto_make(numeric,text)', crypto_schema)) IS NULL
        OR to_regprocedure(format(
               '%I.crypto_amount_value(%I.crypto_amount)', crypto_schema, crypto_schema
+          )) IS NULL
+       OR to_regprocedure(format(
+              '%I.crypto_amount_asset(%I.crypto_amount)', crypto_schema, crypto_schema
           )) IS NULL
        OR to_regprocedure(format(
               '%I.crypto_asset_decimals(%I.crypto_asset)', crypto_schema, crypto_schema
@@ -1030,6 +1396,52 @@ BEGIN
         crypto_schema, fx_schema, crypto_schema,
         crypto_schema, crypto_schema
     );
+    EXECUTE format(
+        $adapter$
+        CREATE OR REPLACE FUNCTION %1$I.fx_convert(
+            value %2$I.crypto_amount,
+            output_asset %2$I.crypto_asset,
+            rate numeric,
+            rounding %1$I.fx_rounding_mode DEFAULT 'half_even'
+        ) RETURNS %2$I.crypto_amount
+        LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+        SET search_path = %1$I, %2$I, pg_catalog
+        AS 'SELECT %1$I.fx_convert($1, $2::text, $3, $4)'
+        $adapter$,
+        fx_schema, crypto_schema
+    );
+    EXECUTE format(
+        $adapter$
+        CREATE OR REPLACE FUNCTION %1$I.fx_create_quote(
+            input %2$I.crypto_amount,
+            output_asset %2$I.crypto_asset,
+            customer_id text DEFAULT NULL,
+            customer_segment text DEFAULT 'retail',
+            expires_in interval DEFAULT interval '30 seconds',
+            rounding %1$I.fx_rounding_mode DEFAULT 'half_even',
+            quote_metadata jsonb DEFAULT '{}'::jsonb
+        ) RETURNS %1$I.fx_quotes
+        LANGUAGE plpgsql VOLATILE
+        SET search_path = %1$I, %2$I, pg_catalog
+        AS $body$
+        BEGIN
+            RETURN %1$I.fx_create_quote(
+                %1$I.fx_pair(%2$I.crypto_amount_asset(input)::text, output_asset::text),
+                'sell_base'::%1$I.fx_side,
+                %2$I.crypto_amount_value(input),
+                customer_segment,
+                customer_id,
+                expires_in,
+                %2$I.crypto_asset_decimals(output_asset),
+                rounding,
+                quote_metadata
+            );
+        END
+        $body$
+        $adapter$,
+        fx_schema, crypto_schema
+    );
+    PERFORM fx_enable_cross_asset_quotes();
     RETURN true;
 END
 $function$;
