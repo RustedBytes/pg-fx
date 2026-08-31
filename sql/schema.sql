@@ -297,20 +297,26 @@ DECLARE
     newest_age interval;
     newest_max_age interval;
 BEGIN
-    SELECT (candidate).*
+    -- Walk enabled sources in priority order and stop as soon as one has a
+    -- fresh observation.  The lateral lookup uses
+    -- fx_rates_source_pair_observed_idx and avoids sorting retained history for
+    -- the pair on every lookup.
+    SELECT candidate.*
     INTO result
-    FROM (
-        SELECT DISTINCT ON (r.source_id) r AS candidate, s.priority
+    FROM fx_sources s
+    CROSS JOIN LATERAL (
+        SELECT r.*
         FROM fx_rates r
-        JOIN fx_sources s ON s.id = r.source_id
-        WHERE r.pair = rate_pair
-          AND s.enabled
+        WHERE r.source_id = s.id
+          AND r.pair = rate_pair
           AND r.observed_at <= as_of
           AND r.received_at <= as_of
           AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
-        ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
-    ) fresh
-    ORDER BY priority, (candidate).source_id
+        ORDER BY r.observed_at DESC, r.received_at DESC, r.id DESC
+        LIMIT 1
+    ) candidate
+    WHERE s.enabled
+    ORDER BY s.priority, s.id
     LIMIT 1;
 
     IF result.id IS NOT NULL THEN
@@ -340,6 +346,31 @@ BEGIN
 END
 $function$;
 
+CREATE FUNCTION fx_rate_candidates(
+    rate_pair fx_pair,
+    as_of timestamptz DEFAULT clock_timestamp()
+)
+RETURNS SETOF fx_rates
+LANGUAGE sql
+STABLE
+ROWS 100
+AS $function$
+    SELECT candidate.*
+    FROM fx_sources s
+    CROSS JOIN LATERAL (
+        SELECT r.*
+        FROM fx_rates r
+        WHERE r.source_id = s.id
+          AND r.pair = rate_pair
+          AND r.observed_at <= as_of
+          AND r.received_at <= as_of
+          AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
+        ORDER BY r.observed_at DESC, r.received_at DESC, r.id DESC
+        LIMIT 1
+    ) candidate
+    WHERE s.enabled
+$function$;
+
 CREATE FUNCTION fx_bid(rate_pair fx_pair, as_of timestamptz DEFAULT clock_timestamp())
 RETURNS numeric LANGUAGE sql STABLE
 AS 'SELECT (fx_rate_current(rate_pair, as_of)).bid';
@@ -357,15 +388,8 @@ RETURNS numeric
 LANGUAGE sql
 STABLE
 AS $function$
-    SELECT max(latest.bid)
-    FROM (
-        SELECT DISTINCT ON (r.source_id) r.bid
-        FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
-        WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
-          AND r.received_at <= as_of
-          AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
-        ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
-    ) latest
+    SELECT max(candidate.bid)
+    FROM fx_rate_candidates(rate_pair, as_of) candidate
 $function$;
 
 CREATE FUNCTION fx_best_ask(rate_pair fx_pair, as_of timestamptz DEFAULT clock_timestamp())
@@ -373,15 +397,8 @@ RETURNS numeric
 LANGUAGE sql
 STABLE
 AS $function$
-    SELECT min(latest.ask)
-    FROM (
-        SELECT DISTINCT ON (r.source_id) r.ask
-        FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
-        WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
-          AND r.received_at <= as_of
-          AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
-        ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
-    ) latest
+    SELECT min(candidate.ask)
+    FROM fx_rate_candidates(rate_pair, as_of) candidate
 $function$;
 
 CREATE FUNCTION fx_composite_rate(
@@ -399,40 +416,19 @@ DECLARE
 BEGIN
     IF strategy = 'latest' THEN
         SELECT candidates.* INTO selected
-        FROM (
-            SELECT DISTINCT ON (r.source_id) r.*
-            FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
-            WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
-              AND r.received_at <= as_of
-              AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
-            ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
-        ) candidates
+        FROM fx_rate_candidates(rate_pair, as_of) candidates
         ORDER BY candidates.observed_at DESC, candidates.received_at DESC, candidates.id DESC
         LIMIT 1;
     ELSIF strategy = 'priority' THEN
         selected := fx_rate_current(rate_pair, as_of);
     ELSIF strategy = 'best_bid' THEN
         SELECT candidates.* INTO selected
-        FROM (
-            SELECT DISTINCT ON (r.source_id) r.*
-            FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
-            WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
-              AND r.received_at <= as_of
-              AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
-            ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
-        ) candidates
+        FROM fx_rate_candidates(rate_pair, as_of) candidates
         ORDER BY candidates.bid DESC, candidates.ask, candidates.id
         LIMIT 1;
     ELSIF strategy = 'best_ask' THEN
         SELECT candidates.* INTO selected
-        FROM (
-            SELECT DISTINCT ON (r.source_id) r.*
-            FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
-            WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
-              AND r.received_at <= as_of
-              AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
-            ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
-        ) candidates
+        FROM fx_rate_candidates(rate_pair, as_of) candidates
         ORDER BY candidates.ask, candidates.bid DESC, candidates.id
         LIMIT 1;
     ELSIF strategy = 'median' THEN
@@ -446,14 +442,7 @@ BEGIN
                 'source_rate_ids', jsonb_agg(candidates.id ORDER BY candidates.id)
             )
         INTO result.bid, result.ask, result.observed_at, result.received_at, result.provenance
-        FROM (
-            SELECT DISTINCT ON (r.source_id) r.*
-            FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
-            WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
-              AND r.received_at <= as_of
-              AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
-            ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
-        ) candidates;
+        FROM fx_rate_candidates(rate_pair, as_of) candidates;
         IF result.bid IS NULL THEN
             PERFORM fx_rate_current(rate_pair, as_of);
         END IF;
@@ -461,13 +450,9 @@ BEGIN
         RETURN result;
     ELSIF strategy = 'weighted_median' THEN
         WITH candidates AS MATERIALIZED (
-            SELECT DISTINCT ON (r.source_id) r.*
-            FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
-            WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
-              AND r.received_at <= as_of
-              AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
-              AND r.volume IS NOT NULL
-            ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
+            SELECT candidate.*
+            FROM fx_rate_candidates(rate_pair, as_of) candidate
+            WHERE candidate.volume IS NOT NULL
         ), weighted_bid AS (
             SELECT bid
             FROM (
@@ -520,15 +505,8 @@ BEGIN
                 'source_rate_ids', jsonb_agg(candidates.id ORDER BY candidates.id)
             )
         INTO result.bid, result.ask, result.observed_at, result.received_at, result.provenance
-        FROM (
-            SELECT DISTINCT ON (r.source_id) r.*
-            FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
-            WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
-              AND r.received_at <= as_of
-              AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
-              AND r.volume IS NOT NULL
-            ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
-        ) candidates;
+        FROM fx_rate_candidates(rate_pair, as_of) candidates
+        WHERE candidates.volume IS NOT NULL;
         IF result.bid IS NULL THEN
             RAISE EXCEPTION 'VWAP requires a fresh rate with volume for pair %', rate_pair
                 USING ERRCODE = 'P0002';
@@ -537,12 +515,8 @@ BEGIN
         RETURN result;
     ELSIF strategy = 'trimmed_mean' THEN
         WITH candidates AS MATERIALIZED (
-            SELECT DISTINCT ON (r.source_id) r.*
-            FROM fx_rates r JOIN fx_sources s ON s.id = r.source_id
-            WHERE r.pair = rate_pair AND s.enabled AND r.observed_at <= as_of
-              AND r.received_at <= as_of
-              AND as_of - r.observed_at <= COALESCE(r.max_age, s.max_age)
-            ORDER BY r.source_id, r.observed_at DESC, r.received_at DESC, r.id DESC
+            SELECT candidate.*
+            FROM fx_rate_candidates(rate_pair, as_of) candidate
         ), ranked AS (
             SELECT candidates.*,
                    row_number() OVER (ORDER BY (bid + ask) / 2, id) AS rank,
@@ -1022,9 +996,53 @@ AS $function$
 DECLARE
     expired_count bigint;
 BEGIN
-    UPDATE fx_quotes
+    -- Concurrent sweepers divide the work instead of waiting on the same due
+    -- rows.  A skipped row remains open for a later sweep if its locker rolls
+    -- back or makes no transition.
+    WITH due AS (
+        SELECT id
+        FROM fx_quotes
+        WHERE status = 'open' AND expires_at <= as_of
+        ORDER BY expires_at, id
+        FOR UPDATE SKIP LOCKED
+    )
+    UPDATE fx_quotes q
     SET status = 'expired', status_changed_at = as_of
-    WHERE status = 'open' AND expires_at <= as_of;
+    FROM due
+    WHERE q.id = due.id;
+    GET DIAGNOSTICS expired_count = ROW_COUNT;
+    RETURN expired_count;
+END
+$function$;
+
+CREATE FUNCTION fx_expire_quotes_batch(
+    batch_size integer DEFAULT 1000,
+    as_of timestamptz DEFAULT clock_timestamp()
+)
+RETURNS bigint
+LANGUAGE plpgsql
+VOLATILE
+AS $function$
+DECLARE
+    expired_count bigint;
+BEGIN
+    IF batch_size IS NULL OR batch_size <= 0 OR batch_size > 100000 THEN
+        RAISE EXCEPTION 'FX quote expiry batch size must be between 1 and 100000'
+            USING ERRCODE = '22023';
+    END IF;
+
+    WITH due AS (
+        SELECT id
+        FROM fx_quotes
+        WHERE status = 'open' AND expires_at <= as_of
+        ORDER BY expires_at, id
+        FOR UPDATE SKIP LOCKED
+        LIMIT batch_size
+    )
+    UPDATE fx_quotes q
+    SET status = 'expired', status_changed_at = as_of
+    FROM due
+    WHERE q.id = due.id;
     GET DIAGNOSTICS expired_count = ROW_COUNT;
     RETURN expired_count;
 END

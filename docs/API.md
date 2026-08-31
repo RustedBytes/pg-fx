@@ -32,13 +32,14 @@ fx_rate_insert(source, rate_pair, rate_bid, rate_ask,
                rate_metadata = {}, rate_volume = NULL)
 fx_rate_latest(rate_pair)
 fx_rate_current(rate_pair, as_of = clock_timestamp())
+fx_rate_candidates(rate_pair, as_of = clock_timestamp())
 ```
 
 `observed_at` is the upstream applicability time; `received_at` is ingestion
-time. Rows in `fx_rates` are append-only. `fx_rate_current` selects the freshest
-observation for each enabled source, rejects observations older than the rate
-or source `max_age`, and chooses the lowest source priority. It raises instead
-of returning a stale price.
+time. Rows in `fx_rates` are append-only. `fx_rate_candidates` returns the
+newest fresh observation for every enabled source. `fx_rate_current` chooses
+the candidate with the lowest source priority. It raises instead of returning
+a stale price.
 
 `fx_rate_latest` returns the globally newest enabled observation without
 applying source priority or staleness. Use `fx_rate_current` for executable
@@ -106,6 +107,7 @@ fx_quote_is_valid(quote_id, as_of = clock_timestamp())
 fx_quote_effective_status(quote_id, as_of = clock_timestamp())
 fx_expire_quote(quote_id, as_of = clock_timestamp())
 fx_expire_quotes(as_of = clock_timestamp())
+fx_expire_quotes_batch(batch_size = 1000, as_of = clock_timestamp())
 fx_execute_quote(quote_id, executed_time = clock_timestamp())
 fx_cancel_quote(quote_id, cancelled_time = clock_timestamp())
 ```
@@ -123,8 +125,11 @@ Only one state transition from `open` is accepted.
 
 Expiry is time-based before stored status is swept: `fx_quote_is_valid` returns
 false and `fx_quote_effective_status` returns `expired` at the boundary. Run
-`fx_expire_quotes()` periodically when persisted status must reflect every due
-quote. Cancellation expires a due quote instead of recording it as cancelled.
+Call `fx_expire_quotes_batch()` repeatedly when persisted status must reflect
+every due quote. Its batches are bounded to 100,000 rows and concurrent workers
+use `SKIP LOCKED` to divide work without waiting on each other.
+`fx_expire_quotes()` performs an unbounded lock-skipping sweep. Cancellation
+expires a due quote instead of recording it as cancelled.
 
 ## Ledger metadata and validation
 

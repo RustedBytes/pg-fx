@@ -264,6 +264,40 @@ mod tests {
     }
 
     #[pg_test]
+    fn quote_expiry_batches_are_bounded() {
+        seed_usd_eur();
+        Spi::run(
+            "SELECT fx_create_quote('USD/EUR', 'sell_base', 100, \
+                                    expires_in => interval '1 second') \
+             FROM generate_series(1, 5);",
+        )
+        .unwrap();
+
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT fx_expire_quotes_batch(2, clock_timestamp() + interval '2 seconds')"
+            )
+            .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM fx_quotes WHERE status = 'open'").unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>(
+                "SELECT fx_expire_quotes_batch(10, clock_timestamp() + interval '2 seconds')"
+            )
+            .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM fx_quotes WHERE status = 'expired'").unwrap(),
+            Some(5)
+        );
+    }
+
+    #[pg_test]
     fn buy_base_quotes_use_ask_and_division() {
         Spi::run(
             "SELECT fx_source_upsert('crypto', 1, true, interval '1 minute'); \

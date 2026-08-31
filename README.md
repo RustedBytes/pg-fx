@@ -133,9 +133,10 @@ SELECT fx_create_quote('USD 100'::money_with_currency, 'BTC'::crypto_asset);
 SELECT fx_create_quote('1 BTC'::crypto_amount, 'USD'::text);
 ```
 
-Use `fx_quote_effective_status()` for a time-correct status without a write, and
-run `fx_expire_quotes()` periodically to persist due `open → expired`
-transitions.
+Use `fx_quote_effective_status()` for a time-correct status without a write. Run
+`fx_expire_quotes_batch()` repeatedly from one or more maintenance workers to
+persist due `open → expired` transitions without long transactions or worker
+lock contention. `fx_expire_quotes()` remains available for an unbounded sweep.
 
 See [the SQL API](docs/API.md), [architecture](docs/ARCHITECTURE.md), and
 [security model](docs/SECURITY.md).
@@ -148,6 +149,7 @@ cargo clippy --all-targets --no-default-features --features pg18 -- \
     -D warnings -W clippy::pedantic
 cargo pgrx test pg18 --no-default-features --features pg18
 ./ci/test-extension.sh "$(cargo pgrx info pg-config 18)"
+./ci/test-highload.sh "$(cargo pgrx info pg-config 18)"
 ./ci/test-companion-extensions.sh "$(cargo pgrx info pg-config 18)" \
     ../pg-cryptocurrency ../pg-ledger
 ```
