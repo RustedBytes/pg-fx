@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-matrix:
+    name: PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17, 18]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust and build prerequisites
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.96.0
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang libclang-dev pkg-config libssl-dev \
+            libreadline-dev zlib1g-dev flex bison libxml2-dev libxslt1-dev \
+            libicu-dev curl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pg-fx-postgres-matrix
+          key: pg${{ matrix.pg }}
+          cache-on-failure: true
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.pgrx
+          key: pg-fx-pgrx-${{ runner.os }}-${{ runner.arch }}-0.19.2-pg${{ matrix.pg }}-v1
+
+      - name: Install and initialize pgrx
+        run: |
+          command -v cargo-pgrx >/dev/null || cargo install cargo-pgrx --version 0.19.2 --locked
+          if ! cargo pgrx info pg-config "${{ matrix.pg }}" >/dev/null 2>&1; then
+            cargo pgrx init --pg${{ matrix.pg }}=download --jobs 2
+          fi
+
+      - name: Check formatting and lints
+        if: matrix.pg == 18
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --no-default-features --features pg18 -- \
+            -D warnings -W clippy::pedantic
+
+      - name: Test extension
+        run: ./ci/test-extension.sh "$(cargo pgrx info pg-config "${{ matrix.pg }}")"
+
+      - name: Verify package contents
+        run: |
+          package_dir="$(mktemp -d)"
+          ./install.sh --pg-config "$(cargo pgrx info pg-config "${{ matrix.pg }}")" --out-dir "$package_dir"
+          test "$(find "$package_dir" -name 'pg_fx--0.1.0.sql' | wc -l)" -eq 1
+          test "$(find "$package_dir" -name 'pg_fx.control' | wc -l)" -eq 1
+          test "$(find "$package_dir" -name 'pg_fx.so' | wc -l)" -eq 1

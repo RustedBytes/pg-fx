@@ -1,0 +1,45 @@
+[package]
+name = "pg_fx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+description = "PostgreSQL-native FX pairs, market rates, conversions, and executable quotes"
+autobins = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg18"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test = []
+
+[dependencies]
+pgrx = "=0.19.2"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+pgrx-tests = "=0.19.2"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[profile.dev]
+panic = "unwind"
+strip = "symbols"
+
+[package.metadata.pgrx]
+extension_name = "pg_fx"
+comment = "PostgreSQL native FX pricing and quote engine"
+default_version = "0.1.0"
+module_pathname = "$libdir/pg_fx"
+relocatable = false
+superuser = false

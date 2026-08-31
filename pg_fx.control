@@ -1,0 +1,5 @@
+comment = 'PostgreSQL native FX pricing and quote engine'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_fx'
+relocatable = false
+superuser = false
